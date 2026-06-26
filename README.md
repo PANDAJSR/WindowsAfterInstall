@@ -12,9 +12,10 @@ Windows 安装后常用设置 / 软件部署脚本。Node.js + [@clack/prompts](
 
 ```
 src/
-  index.js        入口：系统检测 → 权限提升 → 驱动安装(可重试/跳过) → 后续步骤
+  index.js        入口：系统检测 → 权限提升 → 续跑判断 → 步骤流程 → 重启续跑
   sysinfo.js      系统信息采集与校验（PowerShell UTF-8）
-  spawn.js        子进程启动、Aria2 下载、SDIO 调用、SEA 资源释放、UAC 提权
+  spawn.js        子进程启动、Aria2 下载、SDIO 调用、SEA 资源释放、UAC 提权、任务计划、重启
+  status.js       状态文件 wai_status.json 读写（断点续跑）
 scripts/
   fetch-aria2.js  下载 Aria2 Windows 二进制到 bin/aria2/
   fetch-sdio.js   下载 Snappy Driver Installer Origin 到 bin/sdio/sdio.zip
@@ -36,10 +37,18 @@ pnpm run build:standalone   # 打包成 build/wai.exe（自包含，无需 Node.
 ## 流程
 
 1. 系统信息检测：非 Win10/11、非 x64 直接退出。
-2. 管理员权限门控：未提权则询问，选“是”通过 UAC（`Start-Process -Verb RunAs`）重新拉起自身。
-3. 驱动安装：询问是否自动联网下载并安装缺失/更优驱动，选“是”调用 SDIO。
-   出错时可选 **重试 / 跳过此步骤继续后续流程 / 退出**。
-4. 后续配置/部署步骤（待扩展，接在 `index.js` 的 TODO 处）。
+2. 管理员权限门控：未提权则询问，选“是”通过 UAC（`Start-Process -Verb RunAs`）重新拉起自身（透传参数）。
+3. 续跑判断（提权后）：
+   - 带 `/resume` 参数 → 自动续跑，不询问。
+   - 检测到上次未完成（`%SystemDrive%\wai_status.json` 且 `finished=false`）→ 询问是否继续；是则跳过已完成步骤，否则从头开始。
+4. 步骤流程（每步前后写盘 `wai_status.json`）：
+   - 驱动安装：询问是否自动联网下载并安装缺失/更优驱动，选“是”调用 SDIO。出错可选 **重试 / 跳过继续 / 退出**。成功后提示重启，选“是”则创建一次性 AtLogon 任务计划（带 `/resume`）并 `shutdown /r /t 5`；重启登录后自动续跑。
+   - 后续配置/部署步骤（待扩展，追加到 `index.js` 的 `STEPS` 数组即自动获得续跑能力）。
+5. 全部完成 → `按任意键退出`。
+
+### 命令行参数
+
+- `/resume`（或 `-resume` / `--resume`）：自动续跑上次未完成流程，不询问。任务计划重启后用此参数无缝继续。
 
 ## 关键实现
 
@@ -48,6 +57,8 @@ pnpm run build:standalone   # 打包成 build/wai.exe（自包含，无需 Node.
 - **Aria2 下载**：`spawn.js#aria2Download` 调 aria2c，`--split` / `--max-connection-per-server` 控制多线程连接数，默认 16。
 - **SDIO 驱动安装**：`spawn.js#runSdioAutoInstall` 生成安装脚本（基于官方 oakslabs 模板，`enableinstall on`），调用 `SDIO_x64_R830.exe -script:<file> -autoclose`，联网下载索引后安装缺失/更优驱动。SDIO 从内嵌 `sdio.zip` 释放到 `%TEMP%\wai-sdio\`。
 - **UAC 提权**：`spawn.js#relaunchElevated` 用 PowerShell `Start-Process -Verb RunAs` 重启自身，参数按 Windows 规范双引号包裹后以单字符串 `-ArgumentList` 透传，含空格/特殊字符亦稳。
+- **断点续跑**：`status.js` 在 `%SystemDrive%\wai_status.json` 记录 `completedSteps`/`currentStep`/`finished`；`index.js#runFlow` 按 `STEPS` 顺序执行，resume 时跳过已完成步骤。
+- **重启无缝继续**：驱动装完选重启 → `createResumeTask` 注册一次性 AtLogon 任务计划 `WAI_Resume`（RunLevel Highest，免 UAC，带 `/resume`）→ `shutdown /r /t 5`；重启登录后任务拉起脚本自动续跑，并在开头 `deleteResumeTask` 清理一次性任务。
 - **自包含 exe**：`build-standalone.js` 用 esbuild 打包成单文件 CJS → Node SEA 生成 blob → `postject` 注入 `node.exe`；aria2c.exe 与 sdio.zip 作为 SEA asset 内嵌，运行时释放到临时目录。
 
 ## 自定义入口打包

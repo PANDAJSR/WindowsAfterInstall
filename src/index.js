@@ -1,7 +1,28 @@
 import { intro, outro, spinner, confirm, select } from '@clack/prompts';
 import pc from 'picocolors';
-import { relaunchElevated, runSdioAutoInstall } from './spawn.js';
+import {
+  relaunchElevated,
+  runSdioAutoInstall,
+  createResumeTask,
+  deleteResumeTask,
+  restartComputer,
+  isResumeArg,
+} from './spawn.js';
 import { assertWindows10AndX64, collectSystemInfo, printSystemInfo } from './sysinfo.js';
+import {
+  loadStatus,
+  resetStatus,
+  markCurrent,
+  markCompleted,
+  markFinished,
+  isStepDone,
+} from './status.js';
+
+/** 有序步骤列表；后续配置/部署步骤追加到此数组即可自动获得续跑能力。 */
+const STEPS = [
+  { id: 'driver_install', run: runDriverInstallStep },
+  // TODO: 后续步骤接在这里，例如 { id: 'tweaks', run: runTweaksStep }
+];
 
 async function main() {
   intro(pc.bgCyan(pc.black(' WindowsAfterInstall 部署脚本 ')));
@@ -17,7 +38,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 管理员权限门控：无权限则提示提升，选“是”通过 UAC 重新拉起自身
+  // 管理员权限门控：无权限则提示提升，选“是”通过 UAC 重新拉起自身（透传参数）
   if (!info.isAdmin) {
     console.error(pc.yellow('⚠ 当前未以管理员权限运行。'));
     const elevate = await confirm({
@@ -41,21 +62,134 @@ async function main() {
     }
   }
 
-  const ok = await confirm({
-    message: '系统检测通过，是否继续运行？',
-    initialValue: true,
-  });
-  if (!ok) {
-    outro(pc.yellow('用户取消操作。'));
-    process.exit(0);
+  // ── 以下为提权后的实例 ──
+  // 清理一次性恢复任务（幂等），保证任务只在“请求重启”后存在一次
+  await deleteResumeTask();
+
+  // SEA: argv=[exe,'/resume']；dev: argv=[node,'src/index.js','/resume']。
+  // 用 slice(1) 扫描可同时覆盖两种情况。
+  const resumeArg = process.argv.slice(1).some(isResumeArg);
+  let status = await loadStatus();
+
+  if (resumeArg) {
+    // /resume：自动续跑，不询问
+    if (!status || status.finished) {
+      console.log(pc.dim('未发现未完成的进度，从头开始执行。'));
+      status = await resetStatus();
+    } else {
+      console.log(pc.cyan('检测到 /resume 参数，自动继续上次未完成的流程...'));
+    }
+  } else if (status && !status.finished) {
+    // 检测到上次未完成，询问是否续跑
+    const cont = await confirm({
+      message: `检测到上次运行未完成（停于: ${status.currentStep || '未知步骤'}），是否继续上次流程？`,
+      initialValue: true,
+    });
+    if (cont) {
+      console.log(pc.cyan('恢复上次进度，继续执行...'));
+    } else {
+      status = await resetStatus();
+      console.log(pc.cyan('放弃上次进度，从头开始执行...'));
+    }
+  } else {
+    status = await resetStatus();
+    console.log(pc.cyan('开始全新执行...'));
   }
 
-  await runDriverInstallStep();
+  await runFlow(status);
 
-  // TODO: 后续配置/部署步骤接在这里
-
-  outro(pc.green('脚本执行完毕。'));
+  await markFinished();
+  outro(pc.green('🎉 全部流程执行完毕。'));
   await pressAnyKeyToExit();
+}
+
+/**
+ * 按顺序执行步骤；resume 时跳过已完成的步骤。每步前后写盘。
+ */
+async function runFlow(status) {
+  for (const step of STEPS) {
+    if (isStepDone(status, step.id)) {
+      console.log(pc.dim(`↷ 跳过已完成步骤: ${step.id}`));
+      continue;
+    }
+    await markCurrent(step.id);
+    await step.run();
+    await markCompleted(step.id);
+    status = await loadStatus();
+  }
+}
+
+/**
+ * 驱动自动安装步骤：询问 → 调 SDIO 联网下载安装 → 出错可重试/跳过。
+ * 成功安装后提示重启，选“是”则创建一次性任务计划并自动重启。
+ */
+async function runDriverInstallStep() {
+  const want = await confirm({
+    message: '是否自动联网下载并安装缺失/更优驱动（SDIO）？',
+    initialValue: false,
+  });
+  if (!want) {
+    console.log(pc.dim('已跳过驱动安装。'));
+    return;
+  }
+
+  let installed = false;
+  while (true) {
+    const s = spinner();
+    s.start('正在通过 SDIO 联网下载并安装驱动，此过程可能需要几分钟...');
+    try {
+      await runSdioAutoInstall();
+      s.stop('✅ 驱动安装流程完成');
+      installed = true;
+      break;
+    } catch (err) {
+      s.stop(pc.red(`❌ 驱动安装出错: ${err.message}`));
+      const action = await select({
+        message: '驱动安装步骤失败，如何处理？',
+        initialValue: 'retry',
+        options: [
+          { value: 'retry', label: '重试此步骤' },
+          { value: 'skip', label: '跳过此步骤，继续后续流程' },
+          { value: 'abort', label: '退出脚本' },
+        ],
+      });
+      if (action === 'skip') {
+        console.log(pc.dim('已跳过驱动安装步骤。'));
+        return;
+      }
+      if (action === 'abort') {
+        outro(pc.red('用户中止脚本。'));
+        await pressAnyKeyToExit();
+        process.exit(1);
+      }
+      // retry → 继续循环
+    }
+  }
+
+  if (installed) {
+    const restart = await confirm({
+      message: '驱动安装完成，建议重启以使驱动生效。是否现在重启？（重启后将自动继续未完成步骤）',
+      initialValue: true,
+    });
+    if (restart) {
+      // 先把本步进度落盘，再创建任务计划与重启
+      await markCompleted('driver_install');
+      const s = spinner();
+      s.start('正在创建开机自启任务计划并准备重启...');
+      try {
+        await createResumeTask();
+        s.stop('已创建开机自启任务，系统即将重启');
+      } catch (err) {
+        s.stop(pc.red(`创建任务计划失败: ${err.message}`));
+        outro(pc.red('无法创建恢复任务，已取消重启。请手动重启后用 /resume 续跑。'));
+        await pressAnyKeyToExit();
+        process.exit(1);
+      }
+      outro(pc.yellow('系统即将重启，重启登录后将自动继续...'));
+      await restartComputer();
+      process.exit(0);
+    }
+  }
 }
 
 /**
@@ -83,53 +217,12 @@ function pressAnyKeyToExit() {
   });
 }
 
-/**
- * 驱动自动安装步骤：询问是否安装 → 调 SDIO 联网下载安装 → 出错可重试/跳过。
- */
-async function runDriverInstallStep() {
-  const want = await confirm({
-    message: '是否自动联网下载并安装缺失/更优驱动（SDIO）？',
-    initialValue: false,
-  });
-  if (!want) return;
-
-  while (true) {
-    const s = spinner();
-    s.start('正在通过 SDIO 联网下载并安装驱动，此过程可能需要几分钟...');
-    try {
-      await runSdioAutoInstall();
-      s.stop('✅ 驱动安装流程完成');
-      return;
-    } catch (err) {
-      s.stop(pc.red(`❌ 驱动安装出错: ${err.message}`));
-      const action = await select({
-        message: '驱动安装步骤失败，如何处理？',
-        initialValue: 'retry',
-        options: [
-          { value: 'retry', label: '重试此步骤' },
-          { value: 'skip', label: '跳过此步骤，继续后续流程' },
-          { value: 'abort', label: '退出脚本' },
-        ],
-      });
-      if (action === 'skip') {
-        clackNote('已跳过驱动安装步骤。');
-        return;
-      }
-      if (action === 'abort') {
-        outro(pc.red('用户中止脚本。'));
-        process.exit(1);
-      }
-      // retry → 继续循环
-    }
+main().catch(async (err) => {
+  console.error(pc.red(`\n未处理异常: ${err.stack || err.message}`));
+  try {
+    await pressAnyKeyToExit();
+  } catch {
+    // 忽略
   }
-}
-
-function clackNote(msg) {
-  console.log(pc.dim(msg));
-}
-
-main().catch((err) => {
-  console.error(pc.red(`
-未处理异常: ${err.stack || err.message}`));
   process.exit(1);
 });

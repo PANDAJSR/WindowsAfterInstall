@@ -330,3 +330,74 @@ async function fileExists(p) {
     return false;
   }
 }
+
+// ─── 任务计划 / 重启 / 续跑参数 ───────────────────────────────────────────
+const RESUME_TASK_NAME = 'WAI_Resume';
+
+/** 判断某个命令行参数是否为 resume 标志（兼容 / - -- 三种前缀）。 */
+export function isResumeArg(a) {
+  const s = String(a).toLowerCase();
+  return s === '/resume' || s === '-resume' || s === '--resume';
+}
+
+/** 同步执行一段 PowerShell，非零退出抛错（除非 ignoreError）。 */
+function runPowerShell(script, { ignoreError = false } = {}) {
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
+    windowsHide: true,
+    stdio: 'pipe',
+    encoding: 'utf8',
+  });
+  if (r.status !== 0 && !ignoreError) {
+    const err = (r.stderr || '').toString().trim();
+    throw new Error(err || `PowerShell 退出码 ${r.status}`);
+  }
+  return r;
+}
+
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+
+/**
+ * 创建一次性任务计划：用户登录时以最高权限启动本脚本并带 /resume 参数。
+ * 用于重启后无缝续跑。需管理员权限。
+ */
+export async function createResumeTask() {
+  const exe = process.execPath;
+  // 透传当前参数，去除已有的 resume 标志后追加一个，避免重复
+  const args = process.argv
+    .slice(1)
+    .filter((a) => !isResumeArg(a))
+    .concat(['/resume']);
+  const argStr = args.map((a) => `"${a}"`).join(' ');
+  const cwd = path.dirname(exe);
+  const user = process.env.USERNAME || os.userInfo().username;
+
+  const ps = `
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction -Execute ${psQuote(exe)} -Argument ${psQuote(argStr)} -WorkingDirectory ${psQuote(cwd)}
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User ${psQuote(user)}
+$principal = New-ScheduledTaskPrincipal -UserId ${psQuote(user)} -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName ${psQuote(RESUME_TASK_NAME)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+`.trim();
+
+  runPowerShell(ps);
+  console.log(pc.green(`✅ 已创建开机自启任务计划: ${RESUME_TASK_NAME}`));
+}
+
+/**
+ * 删除一次性任务计划（幂等，不存在不报错）。
+ */
+export async function deleteResumeTask() {
+  const ps = `Unregister-ScheduledTask -TaskName ${psQuote(RESUME_TASK_NAME)} -Confirm:$false -ErrorAction SilentlyContinue`;
+  runPowerShell(ps, { ignoreError: true });
+}
+
+/**
+ * 重启计算机：shutdown /r /t 5。需管理员权限。
+ */
+export async function restartComputer() {
+  console.log(pc.yellow('系统将在 5 秒后重启...'));
+  await runExecutable('shutdown.exe', ['/r', '/t', '5', '/c', 'WindowsAfterInstall: 重启以继续未完成的流程']);
+}
