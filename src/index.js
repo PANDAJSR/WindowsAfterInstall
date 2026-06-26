@@ -55,6 +55,32 @@ async function main() {
   // TODO: 后续配置/部署步骤接在这里
 
   outro(pc.green('脚本执行完毕。'));
+  await pressAnyKeyToExit();
+}
+
+/**
+ * 等待用户按任意键后退出。避免双击运行 exe 时窗口一闪而过。
+ * 非 TTY 环境（如管道）直接放行。
+ */
+function pressAnyKeyToExit() {
+  return new Promise((resolve) => {
+    const { stdin } = process;
+    if (!stdin.isTTY) {
+      resolve();
+      return;
+    }
+    console.log(pc.dim('按任意键退出...'));
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.once('data', () => {
+      try {
+        stdin.setRawMode(false);
+      } catch {
+        // 忽略
+      }
+      resolve();
+    });
+  });
 }
 
 /**
@@ -69,7 +95,7 @@ async function runDriverInstallStep() {
 
   while (true) {
     const s = spinner();
-    s.start('正在通过 SDIO 联网下载并安装驱动，请观察 SDIO 窗口...');
+    s.start('正在通过 SDIO 联网下载并安装驱动，此过程可能需要几分钟...');
     try {
       await runSdioAutoInstall();
       s.stop('✅ 驱动安装流程完成');
