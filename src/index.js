@@ -1,4 +1,4 @@
-import { intro, outro, spinner, confirm, select } from '@clack/prompts';
+import { intro, outro, spinner, confirm, select, text } from '@clack/prompts';
 import pc from 'picocolors';
 import {
   relaunchElevated,
@@ -12,6 +12,27 @@ import {
   isDefenderDisabled,
   disableDefenderSoft,
   disableDefenderHard,
+  downloadSmartActivateExe,
+  runSmartActivate,
+  isWindows11,
+  isSearchboxAtIcon,
+  setSearchboxToIcon,
+  isNewsAndInterestsHidden,
+  hideNewsAndInterests,
+  isTouchKeyboardButtonShown,
+  showTouchKeyboardButton,
+  isDesktopIconShown,
+  setDesktopIconVisibility,
+  isRibbonAlwaysExpanded,
+  setRibbonAlwaysExpanded,
+  isClassicContextMenuEnabled,
+  setClassicContextMenu,
+  areHiddenFilesShown,
+  areFileExtensionsShown,
+  setShowHiddenFilesAndExtensions,
+  isExplorerOpenToThisPC,
+  setExplorerOpenToThisPC,
+  restartExplorer,
 } from './spawn.js';
 import { assertWindows10AndX64, collectSystemInfo, printSystemInfo } from './sysinfo.js';
 import {
@@ -28,7 +49,9 @@ const STEPS = [
   { id: 'driver_install', run: runDriverInstallStep },
   { id: 'disable_uac', run: runDisableUacStep },
   { id: 'disable_defender', run: runDisableDefenderStep },
-  // TODO: 后续步骤接在这里，例如 { id: 'tweaks', run: runTweaksStep }
+  { id: 'smart_activate', run: runSmartActivateStep },
+  { id: 'explorer_tweaks', run: runExplorerTweaksStep },
+  // TODO: 后续步骤接在这里
 ];
 
 async function main() {
@@ -284,6 +307,226 @@ async function runDisableDefenderStep() {
   outro(pc.yellow('系统即将重启，重启登录后将自动继续...'));
   await restartComputer();
   process.exit(0);
+}
+
+/**
+ * 智能激活系统步骤：询问 → 下载 HEU KMS Activator 并 MD5 校验 → 以 /smart 模式运行。
+ * 下载失败（无网络等）或 MD5 校验不通过均视为失败，可选 重试 / 跳过 / 退出。
+ */
+async function runSmartActivateStep() {
+  const want = await confirm({
+    message: '是否智能激活 Windows 系统（下载 HEU KMS Activator，以 /smart 模式静默激活）？',
+    initialValue: false,
+  });
+  if (!want) {
+    console.log(pc.dim('已跳过系统激活。'));
+    return;
+  }
+
+  while (true) {
+    // 1. 下载 + MD5 校验
+    let exePath;
+    const s = spinner();
+    s.start('正在下载激活工具并校验 MD5，此过程需要联网...');
+    try {
+      exePath = await downloadSmartActivateExe();
+      s.stop('✅ 激活工具下载完成且 MD5 校验通过');
+    } catch (err) {
+      s.stop(pc.red(`❌ 下载/校验失败: ${err.message}`));
+      const action = await askFailureAction('激活工具下载或 MD5 校验失败，如何处理？');
+      if (action === 'skip') {
+        console.log(pc.dim('已跳过系统激活步骤。'));
+        return;
+      }
+      if (action === 'abort') {
+        outro(pc.red('用户中止脚本。'));
+        await pressAnyKeyToExit();
+        process.exit(1);
+      }
+      continue; // retry
+    }
+
+    // 2. 运行激活
+    const s2 = spinner();
+    s2.start('正在以 /smart 模式运行激活工具，请稍候...');
+    try {
+      await runSmartActivate(exePath);
+      s2.stop(pc.green('✅ 激活流程已执行完成'));
+      return;
+    } catch (err) {
+      s2.stop(pc.red(`❌ 激活执行失败: ${err.message}`));
+      const action = await askFailureAction('激活工具执行失败，如何处理？');
+      if (action === 'skip') {
+        console.log(pc.dim('已跳过系统激活步骤。'));
+        return;
+      }
+      if (action === 'abort') {
+        outro(pc.red('用户中止脚本。'));
+        await pressAnyKeyToExit();
+        process.exit(1);
+      }
+      // retry → 回到循环顶部重新下载校验（确保文件完整）
+    }
+  }
+}
+
+// ─── Desktop Icon CLSIDs（仅供 runExplorerTweaksStep 使用）─────────────────
+const DESKTOP_THIS_PC = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}';
+const DESKTOP_CONTROL_PANEL = '{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}';
+
+/**
+ * Explorer 调整步骤：询问是否调整任务栏/桌面/资源管理器，
+ * 选“否”则跳过整步；选“是”则分三个类别逐一询问，每类用紧凑
+ * y/n 字符串（Y=全部/ N=跳过/ yyn=逐项）选择要执行的调整项。
+ * 每项标注是否已达目标值，已达标则无需再写。全部改完后重启 Explorer。
+ */
+async function runExplorerTweaksStep() {
+  const want = await confirm({
+    message: '是否调整 Explorer 设置（任务栏 / 桌面 / 资源管理器）？',
+    initialValue: false,
+  });
+  if (!want) {
+    console.log(pc.dim('已跳过 Explorer 调整。'));
+    return;
+  }
+
+  const win11 = isWindows11();
+  let anythingChanged = false;
+
+  // ── 任务栏调整 ────────────────────────────────────────────────────────────
+  const taskbarItems = [];
+  if (!win11) {
+    taskbarItems.push({ label: '搜索框改图标', isAtTarget: isSearchboxAtIcon(), apply: setSearchboxToIcon });
+  }
+  taskbarItems.push({ label: '隐藏资讯/小组件', isAtTarget: isNewsAndInterestsHidden(), apply: hideNewsAndInterests });
+  taskbarItems.push({ label: '显示触摸键盘按钮', isAtTarget: isTouchKeyboardButtonShown(), apply: showTouchKeyboardButton });
+  const taskbarSelections = await askCategory('任务栏调整', taskbarItems);
+  if (taskbarSelections) {
+    for (let i = 0; i < taskbarItems.length; i++) {
+      if (taskbarSelections[i] && !taskbarItems[i].isAtTarget) {
+        await taskbarItems[i].apply();
+        anythingChanged = true;
+      }
+    }
+  }
+
+  // ── 桌面调整 ──────────────────────────────────────────────────────────────
+  const desktopItems = [
+    {
+      label: '显示此电脑图标',
+      isAtTarget: isDesktopIconShown(DESKTOP_THIS_PC),
+      apply: () => setDesktopIconVisibility(DESKTOP_THIS_PC, true),
+    },
+    {
+      label: '显示控制面板图标',
+      isAtTarget: isDesktopIconShown(DESKTOP_CONTROL_PANEL),
+      apply: () => setDesktopIconVisibility(DESKTOP_CONTROL_PANEL, true),
+    },
+  ];
+  const desktopSelections = await askCategory('桌面调整', desktopItems);
+  if (desktopSelections) {
+    for (let i = 0; i < desktopItems.length; i++) {
+      if (desktopSelections[i] && !desktopItems[i].isAtTarget) {
+        await desktopItems[i].apply();
+        anythingChanged = true;
+      }
+    }
+  }
+
+  // ── 资源管理器窗口调整 ────────────────────────────────────────────────────
+  const explorerItems = [];
+  if (!win11) {
+    explorerItems.push({ label: '始终显示功能区', isAtTarget: isRibbonAlwaysExpanded(), apply: setRibbonAlwaysExpanded });
+  }
+  if (win11) {
+    explorerItems.push({ label: '恢复经典右键菜单', isAtTarget: isClassicContextMenuEnabled(), apply: setClassicContextMenu });
+  }
+  explorerItems.push({
+    label: '默认显示隐藏文件和文件扩展名',
+    isAtTarget: areHiddenFilesShown() && areFileExtensionsShown(),
+    apply: setShowHiddenFilesAndExtensions,
+  });
+  explorerItems.push({
+    label: '默认打开此电脑而不是快速访问',
+    isAtTarget: isExplorerOpenToThisPC(),
+    apply: setExplorerOpenToThisPC,
+  });
+  const explorerSelections = await askCategory('资源管理器窗口调整', explorerItems);
+  if (explorerSelections) {
+    for (let i = 0; i < explorerItems.length; i++) {
+      if (explorerSelections[i] && !explorerItems[i].isAtTarget) {
+        await explorerItems[i].apply();
+        anythingChanged = true;
+      }
+    }
+  }
+
+  if (anythingChanged) {
+    console.log('');
+    await restartExplorer();
+  } else {
+    console.log(pc.dim('Explorer 调整：无需修改（所有项均已达标或已跳过）。'));
+  }
+}
+
+/**
+ * 向用户展示一个类别的调整项列表，标注各项是否已达目标值，接收 y/n 输入。
+ *
+ * @param {string} categoryName 类别名称
+ * @param {{label:string, isAtTarget:boolean}[]} items
+ * @returns {Promise<boolean[]|null>} 每项对应的选中状态，null 表示用户取消
+ */
+async function askCategory(categoryName, items) {
+  console.log('\n' + pc.cyan(`=== ${categoryName} ===`));
+  for (let i = 0; i < items.length; i++) {
+    const prefix = items[i].isAtTarget ? pc.green('[✓已设]') : pc.dim('[       ]');
+    console.log(`  ${prefix} ${i + 1}. ${items[i].label}`);
+  }
+  console.log('');
+
+  const input = await text({
+    message: `输入 y=执行 / n=跳过 逐项指定，或 Y=全部执行 / N=全部跳过 (${items.length}项)`,
+    placeholder: 'yyn',
+    validate(value) {
+      const v = value.trim();
+      if (v === 'Y' || v === 'y' || v === 'N' || v === 'n') return;
+      if (v.length === 0) return '请输入内容';
+      for (const ch of v) {
+        if (ch !== 'y' && ch !== 'Y' && ch !== 'n' && ch !== 'N') {
+          return `无效字符 "${ch}"，仅支持 y/Y/n/N`;
+        }
+      }
+      if (v.length > items.length) return `输入过长，最多 ${items.length} 个字符`;
+    },
+  });
+
+  if (typeof input !== 'string') return null;
+
+  const trimmed = input.trim();
+  // 单字符快捷（仅大写）：Y = 全部执行，N = 全部跳过
+  if (trimmed === 'Y') return Array(items.length).fill(true);
+  if (trimmed === 'N') return Array(items.length).fill(false);
+
+  // 逐字符解析，不足补 n，多余截断
+  const result = [];
+  for (let i = 0; i < items.length; i++) {
+    const ch = trimmed[i] || 'n';
+    result.push(ch === 'y' || ch === 'Y');
+  }
+  return result;
+}
+
+/** 步骤失败时的统一询问：重试 / 跳过 / 退出。 */
+async function askFailureAction(message) {
+  return await select({
+    message,
+    initialValue: 'retry',
+    options: [
+      { value: 'retry', label: '重试此步骤' },
+      { value: 'skip', label: '跳过此步骤，继续后续流程' },
+      { value: 'abort', label: '退出脚本' },
+    ],
+  });
 }
 
 /**

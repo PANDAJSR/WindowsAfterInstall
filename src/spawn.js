@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { createWriteStream, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createReadStream, createWriteStream, statSync } from 'node:fs';
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -603,4 +604,210 @@ export async function disableDefenderHard() {
       console.log(pc.yellow(`  ⚠ 禁用服务 ${svc} 启动类型失败（受 Tamper 保护），目录重命名为主手段。`));
     });
   }
+}
+
+// ─── 智能激活系统（HEU KMS Activator /smart）─────────────────────────────────
+// 从企业网盘下载 HEU_KMS_Activator，用硬编码 MD5 校验完整性，通过后以 /smart 模式静默激活。
+const SMART_ACTIVATE_URL =
+  'https://pinco.seewo.com/server-main/api/v1/drive/materials/download?resId=73e6d11209334f619b7c87b508ceb5b0';
+// 期望 MD5：首次下载该资源时计算得到，用作后续每次下载的完整性校验基准。
+const SMART_ACTIVATE_MD5 = '948088ec2aae5c189a7c11756082e905';
+const SMART_ACTIVATE_OUT = 'HEU_KMS_Activator.exe';
+
+/** 计算文件的 MD5（流式读取，避免大文件一次性入内存）。 */
+async function md5File(filePath) {
+  const hash = createHash('md5');
+  const stream = createReadStream(filePath);
+  for await (const chunk of stream) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+/**
+ * 下载智能激活工具并用 MD5 校验。下载前会先删除本地残留，确保每次都是全新下载
+ * （避免 aria2 续传命中旧文件导致 MD5 反复失败）。
+ *
+ * @returns {Promise<string>} 校验通过的本地 exe 路径
+ * @throws {Error} 下载失败（无网络等）或 MD5 校验不通过
+ */
+export async function downloadSmartActivateExe() {
+  const dir = path.join(os.tmpdir(), 'wai-activate');
+  await mkdir(dir, { recursive: true });
+  const exePath = path.join(dir, SMART_ACTIVATE_OUT);
+  await rm(exePath, { force: true });
+
+  await aria2Download(SMART_ACTIVATE_URL, dir, { out: SMART_ACTIVATE_OUT, maxTries: 5 });
+
+  const md5 = await md5File(exePath);
+  if (md5 !== SMART_ACTIVATE_MD5) {
+    throw new Error(`MD5 校验失败：期望 ${SMART_ACTIVATE_MD5}，实际 ${md5}`);
+  }
+  console.log(pc.green(`✅ 激活工具 MD5 校验通过: ${md5}`));
+  return exePath;
+}
+
+/**
+ * 以 /smart 模式运行激活工具（静默智能激活）。需管理员权限（由调用方保证）。
+ *
+ * @param {string} exePath
+ * @returns {Promise<number>} 退出码（0 表示成功）
+ * @throws {Error} 启动失败或退出码非零
+ */
+export async function runSmartActivate(exePath) {
+  const args = ['/smart'];
+  console.log(pc.dim(`调用激活工具: ${exePath} ${args.join(' ')}`));
+  const code = await runExecutable(exePath, args, {
+    cwd: path.dirname(exePath),
+    windowsHide: false,
+  });
+  if (code !== 0) {
+    throw new Error(`激活工具执行失败，退出码: ${code}`);
+  }
+  return code;
+}
+
+// ─── Explorer / 任务栏 / 桌面 / 资源管理器 调整 ────────────────────────────────
+// 注册表路径常量
+const EXPLORER_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer';
+const EXPLORER_ADVANCED_KEY = `${EXPLORER_KEY}\\Advanced`;
+const SEARCH_KEY = 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search';
+const TABLET_TIP_KEY = 'HKCU\\SOFTWARE\\Microsoft\\TabletTip\\1.7';
+const FEEDS_POLICY_KEY = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Feeds';
+const HIDE_ICONS_KEY = `${EXPLORER_KEY}\\HideDesktopIcons\\NewStartPanel`;
+const HIDE_ICONS_CLASSIC_KEY = `${EXPLORER_KEY}\\HideDesktopIcons\\ClassicStartMenu`;
+const RIBBON_POLICY_KEY = 'HKCU\\Software\\Policies\\Microsoft\\Windows\\Explorer';
+const CLASSIC_MENU_CLSID_KEY = 'HKCU\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32';
+const THIS_PC_CLSID = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}';
+const CONTROL_PANEL_CLSID = '{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}';
+
+function regKeyExists(key) {
+  const r = spawnSync('reg.exe', ['query', key], {
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  return r.status === 0;
+}
+
+/** 判断当前系统是否为 Windows 11（build >= 22000）。 */
+export function isWindows11() {
+  const parts = os.release().split('.');
+  return parseInt(parts[2] || '0', 10) >= 22000;
+}
+
+// ─── 任务栏 ──────────────────────────────────────────────────────────────────
+
+/** 获取任务栏搜索框模式；不存在返回 null。 */
+export function getSearchboxTaskbarMode() {
+  return readRegDword(SEARCH_KEY, 'SearchboxTaskbarMode');
+}
+
+/** 搜索框是否已改为仅显示图标（Win10: 0=隐藏, 1=图标, 2=搜索框）。 */
+export function isSearchboxAtIcon() {
+  return readRegDword(SEARCH_KEY, 'SearchboxTaskbarMode') === 1;
+}
+
+/** 将任务栏搜索框改为图标。 */
+export async function setSearchboxToIcon() {
+  await runExecutable('reg.exe', ['add', SEARCH_KEY, '/v', 'SearchboxTaskbarMode', '/t', 'REG_DWORD', '/d', '1', '/f']);
+}
+
+/**
+ * 判断资讯/小组件是否已隐藏：
+ * Win10：HKLM 策略 EnableFeeds === 0
+ * Win11：HKCU TaskbarDa === 0
+ */
+export function isNewsAndInterestsHidden() {
+  if (isWindows11()) {
+    return readRegDword(EXPLORER_ADVANCED_KEY, 'TaskbarDa') === 0;
+  }
+  return readRegDword(FEEDS_POLICY_KEY, 'EnableFeeds') === 0;
+}
+
+/** 隐藏任务栏资讯/小组件（Win10 写策略注册表，Win11 隐藏小组件按钮）。 */
+export async function hideNewsAndInterests() {
+  if (isWindows11()) {
+    await runExecutable('reg.exe', ['add', EXPLORER_ADVANCED_KEY, '/v', 'TaskbarDa', '/t', 'REG_DWORD', '/d', '0', '/f']);
+  } else {
+    await runExecutable('reg.exe', ['add', FEEDS_POLICY_KEY, '/v', 'EnableFeeds', '/t', 'REG_DWORD', '/d', '0', '/f']);
+  }
+}
+
+/** 触摸键盘按钮是否已在任务栏显示。 */
+export function isTouchKeyboardButtonShown() {
+  return readRegDword(TABLET_TIP_KEY, 'TipbandDesiredVisibility') === 1;
+}
+
+/** 显示任务栏触摸键盘按钮。 */
+export async function showTouchKeyboardButton() {
+  await runExecutable('reg.exe', ['add', TABLET_TIP_KEY, '/v', 'TipbandDesiredVisibility', '/t', 'REG_DWORD', '/d', '1', '/f']);
+}
+
+// ─── 桌面 ────────────────────────────────────────────────────────────────────
+
+/** 桌面图标是否已显示（0 = 显示，1 或不存在 = 隐藏）。 */
+export function isDesktopIconShown(clsid) {
+  return readRegDword(HIDE_ICONS_KEY, clsid) === 0;
+}
+
+/** 设置桌面图标可见性（0 = 显示，1 = 隐藏）。同时写 NewStartPanel 和 ClassicStartMenu 两个子键。 */
+export async function setDesktopIconVisibility(clsid, show) {
+  const val = show ? '0' : '1';
+  await runExecutable('reg.exe', ['add', HIDE_ICONS_KEY, '/v', clsid, '/t', 'REG_DWORD', '/d', val, '/f']);
+  await runExecutable('reg.exe', ['add', HIDE_ICONS_CLASSIC_KEY, '/v', clsid, '/t', 'REG_DWORD', '/d', val, '/f']);
+}
+
+// ─── 资源管理器 ──────────────────────────────────────────────────────────────
+
+/** 文件管理器功能区是否始终展开（Win10 策略 ExplorerRibbonStartsMinimized === 4）。 */
+export function isRibbonAlwaysExpanded() {
+  return readRegDword(RIBBON_POLICY_KEY, 'ExplorerRibbonStartsMinimized') === 4;
+}
+
+/** 始终展开文件管理器功能区（Win10）。 */
+export async function setRibbonAlwaysExpanded() {
+  await runExecutable('reg.exe', ['add', RIBBON_POLICY_KEY, '/v', 'ExplorerRibbonStartsMinimized', '/t', 'REG_DWORD', '/d', '4', '/f']);
+}
+
+/** 经典右键菜单是否已启用（Win11 InprocServer32 键存在）。 */
+export function isClassicContextMenuEnabled() {
+  return regKeyExists(CLASSIC_MENU_CLSID_KEY);
+}
+
+/** 恢复 Win11 经典右键菜单。空字符串参数经 Node spawn 在 Windows 命令行中变为 ""，reg.exe 视为空数据。 */
+export async function setClassicContextMenu() {
+  await runExecutable('reg.exe', ['add', CLASSIC_MENU_CLSID_KEY, '/ve', '/d', '', '/f']);
+}
+
+/** 是否已显示隐藏文件（Hidden === 1）。 */
+export function areHiddenFilesShown() {
+  return readRegDword(EXPLORER_ADVANCED_KEY, 'Hidden') === 1;
+}
+
+/** 是否已显示文件扩展名（HideFileExt === 0）。 */
+export function areFileExtensionsShown() {
+  return readRegDword(EXPLORER_ADVANCED_KEY, 'HideFileExt') === 0;
+}
+
+/** 同时启用"显示隐藏文件"和"显示文件扩展名"。 */
+export async function setShowHiddenFilesAndExtensions() {
+  await runExecutable('reg.exe', ['add', EXPLORER_ADVANCED_KEY, '/v', 'Hidden', '/t', 'REG_DWORD', '/d', '1', '/f']);
+  await runExecutable('reg.exe', ['add', EXPLORER_ADVANCED_KEY, '/v', 'HideFileExt', '/t', 'REG_DWORD', '/d', '0', '/f']);
+}
+
+/** 文件管理器是否默认打开此电脑（LaunchTo === 1）。 */
+export function isExplorerOpenToThisPC() {
+  return readRegDword(EXPLORER_ADVANCED_KEY, 'LaunchTo') === 1;
+}
+
+/** 设置文件管理器默认打开此电脑而非快速访问。 */
+export async function setExplorerOpenToThisPC() {
+  await runExecutable('reg.exe', ['add', EXPLORER_ADVANCED_KEY, '/v', 'LaunchTo', '/t', 'REG_DWORD', '/d', '1', '/f']);
+}
+
+// ─── 重启 Explorer ───────────────────────────────────────────────────────────
+
+/** 重启 Windows Explorer 以使注册表更改生效。 */
+export async function restartExplorer() {
+  console.log(pc.yellow('正在重启 Windows Explorer...'));
+  await runExecutable('cmd.exe', ['/c', 'taskkill /f /im explorer.exe >nul 2>&1 & start explorer.exe']);
+  console.log(pc.green('✅ Explorer 已重启'));
 }

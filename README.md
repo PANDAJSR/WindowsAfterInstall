@@ -47,6 +47,12 @@ pnpm run build:standalone   # 打包成 build/wai.exe（自包含，无需 Node.
    - 禁用 Windows Defender：检测已禁用则跳过；否则询问，选“是”后**运行时选择**模式：
      - **温和**：写组策略注册表（`DisableAntiSpyware`/`DisableRealtimeMonitoring`/`Spynet` 关闭等）+ `Set-MpPreference` + 禁用 `Microsoft\Windows\Windows Defender\*` 计划任务。完全可逆、立即生效；但 LTSC 2021 (19044) 默认开启 Tamper Protection，可能回滚导致仅部分生效。
      - **硬核**（参考 Sordum Defender Control）：温和 prep 后用 `takeown`+`icacls` 夺取 `C:\Program Files\Windows Defender` 所有权并重命名为 `Windows Defender.disabled`，再禁用 `WinDefend`/`WdNisSvc` 服务。最彻底，**需重启**才能真正停用；选重启则复用 `WAI_Resume` 续跑机制，重启登录后自动续跑。
+   - 智能激活系统：询问是否激活，选“是”则从企业网盘下载 **HEU KMS Activator**，用硬编码 MD5（`948088ec2aae5c189a7c11756082e905`）校验完整性，通过后以 `/smart` 模式静默激活。下载失败（无网络等）或 MD5 校验不通过均视为失败，可选 **重试 / 跳过 / 退出**；校验不通过不会运行激活程序。
+   - **Explorer 调整**：询问是否调整任务栏/桌面/资源管理器，选“否”跳过整步，“是”则依次对三个类别输入 y/n 选择项：
+     - **任务栏调整**（Win10 搜索框→图标、隐藏资讯/小组件、显示触摸键盘按钮；Win11 无搜索框项）
+     - **桌面调整**（显示此电脑图标、显示控制面板图标）
+     - **资源管理器窗口调整**（Win10 始终展开功能区 / Win11 恢复经典右键菜单、显示隐藏文件和文件扩展名、默认打开此电脑而非快速访问）
+     - 每类用紧凑格式：`Y`=全部执行 / `N`=全部跳过 / `yyn`=逐项指定。每项标注是否已达目标值（已达标则跳过不写）。全部改完后自动重启 Explorer 使生效。
    - 后续配置/部署步骤（待扩展，追加到 `index.js` 的 `STEPS` 数组即自动获得续跑能力）。
 5. 全部完成 → `按任意键退出`。
 
@@ -83,6 +89,7 @@ reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /f
 - **UAC 提权**：`spawn.js#relaunchElevated` 用 PowerShell `Start-Process -Verb RunAs` 重启自身，参数按 Windows 规范双引号包裹后以单字符串 `-ArgumentList` 透传，含空格/特殊字符亦稳。
 - **断点续跑**：`status.js` 在 `%SystemDrive%\wai_status.json` 记录 `completedSteps`/`currentStep`/`finished`；`index.js#runFlow` 按 `STEPS` 顺序执行，resume 时跳过已完成步骤。
 - **重启无缝继续**：驱动装完选重启 → `createResumeTask` 注册一次性 AtLogon 任务计划 `WAI_Resume`（RunLevel Highest，免 UAC，带 `/resume`）→ `shutdown /r /t 5`；重启登录后任务拉起脚本自动续跑，并在开头 `deleteResumeTask` 清理一次性任务。
+- **智能激活**：`spawn.js#downloadSmartActivateExe` 用 aria2 下载 HEU_KMS_Activator 到 `%TEMP%\wai-activate\`（下载前删残留避免续传命中旧文件），流式计算 MD5 与硬编码期望值比对，不通过抛错；`runSmartActivate` 以 `/smart` 参数运行。
 - **自包含 exe**：`build-standalone.js` 用 esbuild 打包成单文件 CJS → Node SEA 生成 blob → `postject` 注入 `node.exe`；aria2c.exe 与 sdio.zip 作为 SEA asset 内嵌，运行时释放到临时目录。
 
 ## 自定义入口打包
