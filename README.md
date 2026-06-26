@@ -43,12 +43,36 @@ pnpm run build:standalone   # 打包成 build/wai.exe（自包含，无需 Node.
    - 检测到上次未完成（`%SystemDrive%\wai_status.json` 且 `finished=false`）→ 询问是否继续；是则跳过已完成步骤，否则从头开始。
 4. 步骤流程（每步前后写盘 `wai_status.json`）：
    - 驱动安装：询问是否自动联网下载并安装缺失/更优驱动，选“是”调用 SDIO。出错可选 **重试 / 跳过继续 / 退出**。成功后提示重启，选“是”则创建一次性 AtLogon 任务计划（带 `/resume`）并 `shutdown /r /t 5`；重启登录后自动续跑。
+   - 禁用 UAC 弹窗：检测已禁用则跳过；否则询问，选“是”写注册表（`ConsentPromptBehaviorAdmin=0`、`PromptOnSecureDesktop=0`），立即生效。
+   - 禁用 Windows Defender：检测已禁用则跳过；否则询问，选“是”后**运行时选择**模式：
+     - **温和**：写组策略注册表（`DisableAntiSpyware`/`DisableRealtimeMonitoring`/`Spynet` 关闭等）+ `Set-MpPreference` + 禁用 `Microsoft\Windows\Windows Defender\*` 计划任务。完全可逆、立即生效；但 LTSC 2021 (19044) 默认开启 Tamper Protection，可能回滚导致仅部分生效。
+     - **硬核**（参考 Sordum Defender Control）：温和 prep 后用 `takeown`+`icacls` 夺取 `C:\Program Files\Windows Defender` 所有权并重命名为 `Windows Defender.disabled`，再禁用 `WinDefend`/`WdNisSvc` 服务。最彻底，**需重启**才能真正停用；选重启则复用 `WAI_Resume` 续跑机制，重启登录后自动续跑。
    - 后续配置/部署步骤（待扩展，追加到 `index.js` 的 `STEPS` 数组即自动获得续跑能力）。
 5. 全部完成 → `按任意键退出`。
 
 ### 命令行参数
 
 - `/resume`（或 `-resume` / `--resume`）：自动续跑上次未完成流程，不询问。任务计划重启后用此参数无缝继续。
+
+### 手动还原 Windows Defender（硬核模式）
+
+硬核模式较难逆转，需手动还原：
+
+```bat
+:: 1. 恢复目录名
+ren "C:\Program Files\Windows Defender.disabled" "Windows Defender"
+:: 2. 恢复服务启动类型
+sc config WinDefend start= demand
+sc config WdNisSvc start= demand
+:: 3. 重新启用计划任务
+schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance" /Enable
+schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Cleanup" /Enable
+schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan" /Enable
+schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Verification" /Enable
+:: 4. 删除策略注册表项
+reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /f
+:: 5. 打开「Windows 安全中心」→ 病毒和威胁防护 → 重新开启 Tamper Protection 与实时保护
+```
 
 ## 关键实现
 

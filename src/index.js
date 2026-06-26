@@ -9,6 +9,9 @@ import {
   isResumeArg,
   isUacDisabled,
   disableUac,
+  isDefenderDisabled,
+  disableDefenderSoft,
+  disableDefenderHard,
 } from './spawn.js';
 import { assertWindows10AndX64, collectSystemInfo, printSystemInfo } from './sysinfo.js';
 import {
@@ -24,6 +27,7 @@ import {
 const STEPS = [
   { id: 'driver_install', run: runDriverInstallStep },
   { id: 'disable_uac', run: runDisableUacStep },
+  { id: 'disable_defender', run: runDisableDefenderStep },
   // TODO: 后续步骤接在这里，例如 { id: 'tweaks', run: runTweaksStep }
 ];
 
@@ -213,6 +217,73 @@ async function runDisableUacStep() {
   }
   await disableUac();
   console.log(pc.green('✅ 已禁用 UAC 弹窗（立即生效）'));
+}
+
+/**
+ * 禁用 Windows Defender 步骤：若已禁用则提示并跳过；否则询问是否禁用，
+ * 是则运行时选择温和 / 硬核模式。硬核模式需重启生效，选重启则复用续跑机制。
+ */
+async function runDisableDefenderStep() {
+  if (isDefenderDisabled()) {
+    console.log(pc.dim('Windows Defender 已禁用，跳过此步骤。'));
+    return;
+  }
+  const want = await confirm({
+    message: '是否禁用 Windows Defender？',
+    initialValue: false,
+  });
+  if (!want) {
+    console.log(pc.dim('未禁用 Defender，跳过。'));
+    return;
+  }
+
+  const mode = await select({
+    message: '选择禁用模式：',
+    initialValue: 'soft',
+    options: [
+      { value: 'soft', label: '温和：策略注册表 + PowerShell（可逆，可能被 Tamper Protection 回滚）' },
+      { value: 'hard', label: '硬核：重命名 Defender 目录 + 禁用服务（彻底，需重启，较难逆转）' },
+    ],
+  });
+
+  if (mode === 'soft') {
+    const s = spinner();
+    s.start('正在以温和模式禁用 Defender...');
+    await disableDefenderSoft();
+    s.stop(pc.green('✅ 已尝试禁用 Defender（温和模式，立即生效）'));
+    return;
+  }
+
+  // 硬核模式
+  const s = spinner();
+  s.start('正在以硬核模式禁用 Defender（夺权 + 重命名目录 + 禁用服务）...');
+  await disableDefenderHard();
+  s.stop(pc.green('✅ 硬核禁用操作已执行，需重启才能真正停用'));
+
+  const restart = await confirm({
+    message: '硬核模式需重启才能真正停用 Defender。是否现在重启？（重启后将自动继续未完成步骤）',
+    initialValue: true,
+  });
+  if (!restart) {
+    console.log(pc.yellow('硬核模式需重启才能真正停用 Defender，请稍后手动重启。'));
+    return;
+  }
+  // 先把本步进度落盘，再创建任务计划与重启
+  await markCompleted('disable_defender');
+  const s2 = spinner();
+  s2.start('正在创建开机自启任务计划并准备重启...');
+  try {
+    await createResumeTask();
+    s2.stop('已创建开机自启任务，系统即将重启');
+  } catch (err) {
+    s2.stop(pc.red(`创建任务计划失败: ${err.message}`));
+    outro(pc.red('无法创建恢复任务，已取消重启。请手动重启后用 /resume 续跑。'));
+    await pressAnyKeyToExit();
+    process.exit(1);
+  }
+  outro(pc.yellow('系统即将重启，重启登录后将自动继续...'));
+  await restartComputer();
+  process.exit(0);
 }
 
 /**

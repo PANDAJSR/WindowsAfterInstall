@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, statSync } from 'node:fs';
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -433,4 +433,174 @@ export function isUacDisabled() {
 export async function disableUac() {
   await runExecutable('reg.exe', ['add', UAC_KEY, '/v', 'ConsentPromptBehaviorAdmin', '/t', 'REG_DWORD', '/d', '0', '/f']);
   await runExecutable('reg.exe', ['add', UAC_KEY, '/v', 'PromptOnSecureDesktop', '/t', 'REG_DWORD', '/d', '0', '/f']);
+}
+
+// ─── Windows Defender ───────────────────────────────────────────────────────
+// 参考 Sordum Defender Control 等开源做法。目标系统 LTSC 2021 (19044) 默认开启
+// Tamper Protection，会回滚纯注册表/PowerShell 的修改，故提供「温和」「硬核」两种模式。
+const DEFENDER_DIR = `${process.env.ProgramFiles || 'C:\\Program Files'}\\Windows Defender`;
+const DEFENDER_DIR_DISABLED = `${DEFENDER_DIR}.disabled`;
+const DEFENDER_POLICY_KEY = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender';
+const DEFENDER_FEATURES_KEY = 'HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Features';
+const DEFENDER_TASK_PATH = '\\Microsoft\\Windows\\Windows Defender';
+
+/** 写一个 REG_DWORD 值（自动创建键）。 */
+async function writeRegDword(key, value, data) {
+  await runExecutable('reg.exe', ['add', key, '/v', value, '/t', 'REG_DWORD', '/d', String(data), '/f']);
+}
+
+/** 查询服务启动类型：返回 0xN 数字，查询失败返回 null。 */
+function getServiceStartType(service) {
+  const r = spawnSync('sc.exe', ['qc', service], { windowsHide: true, encoding: 'utf8' });
+  if (r.status !== 0) return null;
+  const m = r.stdout.match(/START_TYPE\s*:\s*(0x[0-9a-fA-F]+)/);
+  return m ? parseInt(m[1], 16) : null;
+}
+
+/**
+ * 判断 Windows Defender 是否已被禁用。任一强信号命中即视为已禁用：
+ *  - WinDefend 服务启动类型为 4（disabled）
+ *  - Defender 目录不存在，或已存在 .disabled 重命名残留
+ *  - 实时保护关闭 且 策略 DisableAntiSpyware=1
+ */
+export function isDefenderDisabled() {
+  // 服务启动类型
+  const startType = getServiceStartType('WinDefend');
+  if (startType === 4) return true;
+
+  // 目录被重命名 / 不存在
+  let dirExists = true;
+  try {
+    statSync(DEFENDER_DIR);
+  } catch {
+    dirExists = false;
+  }
+  let disabledDirExists = false;
+  try {
+    statSync(DEFENDER_DIR_DISABLED);
+    disabledDirExists = true;
+  } catch {
+    // 不存在
+  }
+  if (!dirExists || disabledDirExists) return true;
+
+  // 辅证：实时保护关闭 + 策略禁用
+  const antispy = readRegDword(`${DEFENDER_POLICY_KEY}`, 'DisableAntiSpyware');
+  if (antispy === 1) {
+    let realtimeOn = null;
+    try {
+      const r = runPowerShell(
+        '(Get-MpComputerStatus -ErrorAction Stop).RealTimeProtectionEnabled',
+        { ignoreError: true }
+      );
+      const v = (r.stdout || '').toString().trim().toLowerCase();
+      if (v === 'true') realtimeOn = true;
+      else if (v === 'false') realtimeOn = false;
+    } catch {
+      // Defender 已损坏/不可查询，忽略
+    }
+    if (realtimeOn === false) return true;
+  }
+  return false;
+}
+
+/** 禁用 Defender 计划任务（枚举 \Microsoft\Windows\Windows Defender\* 逐个 Disable）。 */
+async function disableDefenderScheduledTasks() {
+  const r = runPowerShell(
+    `Get-ScheduledTask -TaskPath ${psQuote(DEFENDER_TASK_PATH + '\\')} -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName }`,
+    { ignoreError: true }
+  );
+  const names = (r.stdout || '')
+    .toString()
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const name of names) {
+    await runExecutable('schtasks.exe', [
+      '/Change',
+      '/TN',
+      `${DEFENDER_TASK_PATH}\\${name}`,
+      '/Disable',
+    ]).catch(() => {
+      console.log(pc.yellow(`  ⚠ 禁用计划任务失败: ${name}`));
+    });
+  }
+}
+
+/**
+ * 温和模式：写组策略注册表 + Set-MpPreference + 禁用计划任务。
+ * 完全可逆、立即生效；但 19044 + Tamper Protection 开启时可能被回滚，仅部分生效。
+ */
+export async function disableDefenderSoft() {
+  // 关 Tamper Protection（best-effort，受保护时写不进/被回滚）
+  await writeRegDword(DEFENDER_FEATURES_KEY, 'TamperProtection', 0).catch(() => {
+    console.log(pc.yellow('  ⚠ 关闭 Tamper Protection 失败（可能已被保护），继续尝试其余步骤。'));
+  });
+
+  // 组策略注册表
+  await writeRegDword(DEFENDER_POLICY_KEY, 'DisableAntiSpyware', 1);
+  await writeRegDword(DEFENDER_POLICY_KEY, 'AllowFastServiceStartup', 0);
+  await writeRegDword(DEFENDER_POLICY_KEY, 'ServiceKeepAlive', 0);
+  const rtpKey = `${DEFENDER_POLICY_KEY}\\Real-Time Protection`;
+  await writeRegDword(rtpKey, 'DisableRealtimeMonitoring', 1);
+  await writeRegDword(rtpKey, 'DisableBehaviorMonitoring', 1);
+  await writeRegDword(rtpKey, 'DisableIOAVProtection', 1);
+  await writeRegDword(rtpKey, 'DisableScriptScanning', 1);
+  await writeRegDword(rtpKey, 'DisableOnAccessProtection', 1);
+  const spynetKey = `${DEFENDER_POLICY_KEY}\\Spynet`;
+  await writeRegDword(spynetKey, 'SpynetReporting', 0);
+  await writeRegDword(spynetKey, 'SubmitSamplesConsent', 2);
+  const uxKey = `${DEFENDER_POLICY_KEY}\\UX Configuration`;
+  await writeRegDword(uxKey, 'Notification_Suppress', 1);
+
+  // Set-MpPreference（Tamper 开启时会失败，忽略）
+  runPowerShell(
+    'Set-MpPreference -DisableRealtimeMonitoring $true -DisableAntiSpyware $true -DisableBehaviorMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -DisableBlockAtFirstSeen $true -ErrorAction SilentlyContinue',
+    { ignoreError: true }
+  );
+
+  await disableDefenderScheduledTasks();
+}
+
+/**
+ * 硬核模式：温和 prep → 夺取目录所有权 → 重命名目录 → 禁用服务。
+ * 需重启才能真正停用；较难逆转。Windows 允许在服务运行时重命名其目录
+ * （已打开句柄仍有效，但路径消失），重启后 MsMpEng.exe 找不到路径无法启动。
+ */
+export async function disableDefenderHard() {
+  await disableDefenderSoft();
+
+  // 夺取目录所有权并授予 Administrators 完全控制
+  await runExecutable('takeown.exe', ['/f', DEFENDER_DIR, '/r', '/d', 'Y']).catch((err) => {
+    console.log(pc.yellow(`  ⚠ takeown 失败: ${err.message}`));
+  });
+  await runExecutable('icacls.exe', [
+    DEFENDER_DIR,
+    '/grant',
+    '*S-1-5-32-544:F',
+    '/t',
+    '/c',
+    '/q',
+  ]).catch((err) => {
+    console.log(pc.yellow(`  ⚠ icacls 授权失败: ${err.message}`));
+  });
+
+  // 若已有 .disabled 残留，先尝试清理（避免 rename 目标已存在）
+  try {
+    await rm(DEFENDER_DIR_DISABLED, { recursive: true, force: true });
+  } catch {
+    // 忽略
+  }
+
+  // 重命名目录（主手段）
+  await rename(DEFENDER_DIR, DEFENDER_DIR_DISABLED).catch((err) => {
+    console.log(pc.yellow(`  ⚠ 重命名 Defender 目录失败: ${err.message}（重启后可再次运行重试）`));
+  });
+
+  // 禁用服务启动类型（best-effort，受 Tamper 保护可能失败）
+  for (const svc of ['WinDefend', 'WdNisSvc']) {
+    await runExecutable('sc.exe', ['config', svc, 'start=', 'disabled']).catch(() => {
+      console.log(pc.yellow(`  ⚠ 禁用服务 ${svc} 启动类型失败（受 Tamper 保护），目录重命名为主手段。`));
+    });
+  }
 }
