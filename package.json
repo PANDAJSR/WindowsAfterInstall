@@ -1,0 +1,24 @@
+{
+  "name": "windows-after-install",
+  "version": "0.0.1",
+  "description": "Windows 安装后常用设置/软件部署脚本",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "build:standalone": "node scripts/build-standalone.js",
+    "fetch:aria2": "node scripts/fetch-aria2.js"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@9.0.0"
+}
