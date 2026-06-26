@@ -401,3 +401,36 @@ export async function restartComputer() {
   console.log(pc.yellow('系统将在 5 秒后重启...'));
   await runExecutable('shutdown.exe', ['/r', '/t', '5', '/c', 'WindowsAfterInstall: 重启以继续未完成的流程']);
 }
+
+// ─── UAC 注册表 ────────────────────────────────────────────────────────────
+const UAC_KEY = 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System';
+
+/** 读取一个 REG_DWORD 值，不存在返回 null。 */
+function readRegDword(key, value) {
+  const r = spawnSync('reg.exe', ['query', key, '/v', value], {
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) return null;
+  const m = r.stdout.match(/0x[0-9a-fA-F]+\b/);
+  return m ? parseInt(m[0], 16) : null;
+}
+
+/**
+ * 判断 UAC 弹窗是否已被禁用。
+ * ConsentPromptBehaviorAdmin=0 且 PromptOnSecureDesktop=0 表示管理员提权不弹窗。
+ * 缺省值：ConsentPromptBehaviorAdmin=5, PromptOnSecureDesktop=1。
+ */
+export function isUacDisabled() {
+  const consent = readRegDword(UAC_KEY, 'ConsentPromptBehaviorAdmin') ?? 5;
+  const secure = readRegDword(UAC_KEY, 'PromptOnSecureDesktop') ?? 1;
+  return consent === 0 && secure === 0;
+}
+
+/**
+ * 禁用 UAC 弹窗：写两个注册表值。需管理员权限，重启后生效。
+ */
+export async function disableUac() {
+  await runExecutable('reg.exe', ['add', UAC_KEY, '/v', 'ConsentPromptBehaviorAdmin', '/t', 'REG_DWORD', '/d', '0', '/f']);
+  await runExecutable('reg.exe', ['add', UAC_KEY, '/v', 'PromptOnSecureDesktop', '/t', 'REG_DWORD', '/d', '0', '/f']);
+}

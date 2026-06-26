@@ -7,6 +7,8 @@ import {
   deleteResumeTask,
   restartComputer,
   isResumeArg,
+  isUacDisabled,
+  disableUac,
 } from './spawn.js';
 import { assertWindows10AndX64, collectSystemInfo, printSystemInfo } from './sysinfo.js';
 import {
@@ -21,6 +23,7 @@ import {
 /** 有序步骤列表；后续配置/部署步骤追加到此数组即可自动获得续跑能力。 */
 const STEPS = [
   { id: 'driver_install', run: runDriverInstallStep },
+  { id: 'disable_uac', run: runDisableUacStep },
   // TODO: 后续步骤接在这里，例如 { id: 'tweaks', run: runTweaksStep }
 ];
 
@@ -190,6 +193,26 @@ async function runDriverInstallStep() {
       process.exit(0);
     }
   }
+}
+
+/**
+ * 禁用 UAC 弹窗步骤：若已禁用则提示并跳过；否则询问是否禁用，是则写注册表（立即生效）。
+ */
+async function runDisableUacStep() {
+  if (isUacDisabled()) {
+    console.log(pc.dim('UAC 弹窗已禁用，跳过此步骤。'));
+    return;
+  }
+  const want = await confirm({
+    message: '是否禁用 UAC 弹窗（管理员提权时不再弹出确认窗）？',
+    initialValue: false,
+  });
+  if (!want) {
+    console.log(pc.dim('未禁用 UAC，跳过。'));
+    return;
+  }
+  await disableUac();
+  console.log(pc.green('✅ 已禁用 UAC 弹窗（立即生效）'));
 }
 
 /**
