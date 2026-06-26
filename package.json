@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "build:standalone": "node scripts/build-standalone.js",
-    "fetch:aria2": "node scripts/fetch-aria2.js"
+    "fetch:aria2": "node scripts/fetch-aria2.js",
+    "fetch:sdio": "node scripts/fetch-sdio.js",
+    "fetch:all": "pnpm run fetch:aria2 && pnpm run fetch:sdio"
   },
   "dependencies": {
     "@clack/prompts": "^0.10.0",

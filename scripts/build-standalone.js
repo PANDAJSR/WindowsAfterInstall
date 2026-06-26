@@ -6,8 +6,8 @@ import * as esbuild from 'esbuild';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const buildDir = path.join(root, 'build');
-const binDir = path.join(root, 'bin', 'aria2');
-const aria2Exe = path.join(binDir, 'aria2c.exe');
+const aria2Exe = path.join(root, 'bin', 'aria2', 'aria2c.exe');
+const sdioZip = path.join(root, 'bin', 'sdio', 'sdio.zip');
 const seaConfigPath = path.join(buildDir, 'sea-config.json');
 const blobPath = path.join(buildDir, 'wai.blob');
 const exePath = path.join(buildDir, 'wai.exe');
@@ -17,6 +17,9 @@ async function main() {
 
   await stat(aria2Exe).catch(() => {
     throw new Error(`找不到 aria2c.exe，请先运行 pnpm run fetch:aria2`);
+  });
+  await stat(sdioZip).catch(() => {
+    throw new Error(`找不到 SDIO zip，请先运行 pnpm run fetch:sdio`);
   });
 
   await rm(buildDir, { recursive: true, force: true });
@@ -40,7 +43,7 @@ async function main() {
     },
   });
 
-  // 2. generate SEA config with aria2 asset
+  // 2. generate SEA config with aria2 + sdio assets
   const seaConfig = {
     main: bundleOut,
     output: blobPath,
@@ -49,6 +52,7 @@ async function main() {
     useCodeCache: false,
     assets: {
       'aria2c.exe': aria2Exe,
+      'sdio.zip': sdioZip,
     },
   };
   await writeFile(seaConfigPath, JSON.stringify(seaConfig, null, 2));

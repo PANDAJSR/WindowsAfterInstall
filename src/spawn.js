@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
-import { chmod, mkdir, rename, rm, stat } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -244,4 +244,89 @@ async function extractZip(zipPath, destDir) {
     `powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`,
     { stdio: 'inherit' }
   );
+}
+
+// ─── Snappy Driver Installer Origin (SDIO) ─────────────────────────────────
+// SDIO 自动安装脚本：联网下载索引 → 选出缺失/更优驱动 → 安装。
+// 基于官方 scripts/oakslabs-test.txt 模板，enableinstall 设为 on 以真正安装。
+const SDIO_INSTALL_SCRIPT = `verbose 384
+logging on
+enableinstall on
+init
+checkupdates
+get indexes
+restorepoint WAI Driver Installation
+select missing better
+install
+end
+`;
+
+/**
+ * 确保 SDIO 已解压到缓存目录并返回该目录。
+ * SEA 打包模式下从内嵌 sdio.zip 资源释放；开发模式从 bin/sdio/sdio.zip 释放。
+ *
+ * @returns {Promise<string>} SDIO 所在目录
+ */
+export async function getSdioDir() {
+  const cacheDir = path.join(os.tmpdir(), 'wai-sdio');
+  const exe = path.join(cacheDir, 'SDIO_x64_R830.exe');
+  if (await fileExists(exe)) return cacheDir;
+
+  await mkdir(cacheDir, { recursive: true });
+
+  let zipBuf;
+  if (isPackaged()) {
+    const sea = process.getBuiltinModule('node:sea');
+    zipBuf = Buffer.from(sea.getAsset('sdio.zip'));
+  } else {
+    const localZip = path.resolve(dirname(), '..', 'bin', 'sdio', 'sdio.zip');
+    try {
+      zipBuf = await readFile(localZip);
+    } catch {
+      throw new Error(`本地 SDIO zip 不存在: ${localZip}，请先运行 pnpm run fetch:sdio 下载。`);
+    }
+  }
+
+  const tmpZip = path.join(cacheDir, 'sdio.zip');
+  await writeFile(tmpZip, zipBuf);
+  await extractZip(tmpZip, cacheDir);
+  await rm(tmpZip, { force: true });
+
+  if (!(await fileExists(exe))) {
+    throw new Error(`SDIO 解压后未找到 ${exe}`);
+  }
+  console.log(pc.green(`✅ SDIO 已就绪: ${exe}`));
+  return cacheDir;
+}
+
+/**
+ * 调用 SDIO 自动联网下载并安装缺失/更优驱动。
+ * 需管理员权限（由调用方保证）。
+ *
+ * @returns {Promise<number>} 退出码（0 表示成功）
+ * @throws {Error} 启动失败或退出码非零
+ */
+export async function runSdioAutoInstall() {
+  const dir = await getSdioDir();
+  const exe = path.join(dir, 'SDIO_x64_R830.exe');
+  const scriptPath = path.join(dir, 'wai_install.txt');
+  await writeFile(scriptPath, SDIO_INSTALL_SCRIPT, 'utf8');
+
+  const args = ['-script:' + scriptPath, '-autoclose'];
+  console.log(pc.dim(`调用 SDIO: ${exe} ${args.join(' ')}`));
+  // GUI 应用：windowsHide 设为 false 以确保窗口可见，用户可观察下载/安装进度
+  const code = await runExecutable(exe, args, { cwd: dir, windowsHide: false });
+  if (code !== 0) {
+    throw new Error(`SDIO 执行失败，退出码: ${code}`);
+  }
+  return code;
+}
+
+async function fileExists(p) {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
 }

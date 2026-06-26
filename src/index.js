@@ -1,6 +1,6 @@
-import { intro, outro, spinner, text, confirm } from '@clack/prompts';
+import { intro, outro, spinner, confirm, select } from '@clack/prompts';
 import pc from 'picocolors';
-import { aria2Download, relaunchElevated } from './spawn.js';
+import { relaunchElevated, runSdioAutoInstall } from './spawn.js';
 import { assertWindows10AndX64, collectSystemInfo, printSystemInfo } from './sysinfo.js';
 
 async function main() {
@@ -50,30 +50,56 @@ async function main() {
     process.exit(0);
   }
 
-  const testDownload = await confirm({
-    message: '是否测试 aria2 下载一个 HTTP 文件？',
-    initialValue: true,
-  });
-  if (testDownload) {
-    const url = await text({
-      message: '请输入要下载的 URL',
-      defaultValue: 'https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip',
-      placeholder: 'https://example.com/file.zip',
-    });
-    if (typeof url === 'string') {
-      const s = spinner();
-      s.start('正在使用 aria2 多线程下载...');
-      try {
-        const out = await aria2Download(url, './downloads', { connections: 16 });
-        s.stop(`下载完成: ${out}`);
-      } catch (err) {
-        s.stop(pc.red(`下载失败: ${err.message}`));
-        throw err;
-      }
-    }
-  }
+  await runDriverInstallStep();
+
+  // TODO: 后续配置/部署步骤接在这里
 
   outro(pc.green('脚本执行完毕。'));
+}
+
+/**
+ * 驱动自动安装步骤：询问是否安装 → 调 SDIO 联网下载安装 → 出错可重试/跳过。
+ */
+async function runDriverInstallStep() {
+  const want = await confirm({
+    message: '是否自动联网下载并安装缺失/更优驱动（SDIO）？',
+    initialValue: false,
+  });
+  if (!want) return;
+
+  while (true) {
+    const s = spinner();
+    s.start('正在通过 SDIO 联网下载并安装驱动，请观察 SDIO 窗口...');
+    try {
+      await runSdioAutoInstall();
+      s.stop('✅ 驱动安装流程完成');
+      return;
+    } catch (err) {
+      s.stop(pc.red(`❌ 驱动安装出错: ${err.message}`));
+      const action = await select({
+        message: '驱动安装步骤失败，如何处理？',
+        initialValue: 'retry',
+        options: [
+          { value: 'retry', label: '重试此步骤' },
+          { value: 'skip', label: '跳过此步骤，继续后续流程' },
+          { value: 'abort', label: '退出脚本' },
+        ],
+      });
+      if (action === 'skip') {
+        clackNote('已跳过驱动安装步骤。');
+        return;
+      }
+      if (action === 'abort') {
+        outro(pc.red('用户中止脚本。'));
+        process.exit(1);
+      }
+      // retry → 继续循环
+    }
+  }
+}
+
+function clackNote(msg) {
+  console.log(pc.dim(msg));
 }
 
 main().catch((err) => {
