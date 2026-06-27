@@ -1,5 +1,6 @@
 import { intro, outro, spinner, confirm, select, text } from '@clack/prompts';
 import pc from 'picocolors';
+import { runSoftwareStep } from './software.js';
 import {
   relaunchElevated,
   runSdioAutoInstall,
@@ -51,6 +52,7 @@ const STEPS = [
   { id: 'disable_defender', run: runDisableDefenderStep },
   { id: 'smart_activate', run: runSmartActivateStep },
   { id: 'explorer_tweaks', run: runExplorerTweaksStep },
+  { id: 'install_software', run: runSoftwareStep },
   // TODO: 后续步骤接在这里
 ];
 
